@@ -16,7 +16,6 @@ use waproto::whatsapp::ADVEncryptionType;
 const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
 const ADV_PREFIX_DEVICE_SIGNATURE_GENERATE: &[u8] = &[6, 1];
 const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
-const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION: &[u8] = &[6, 6];
 
 // Aliases for HMAC-SHA256
 type HmacSha256 = Hmac<Sha256>;
@@ -249,7 +248,17 @@ impl PairUtils {
             .unwrap_or_default()
             .to_vec();
 
-        let account_sig_prefix = if is_hosted_account {
+        // Backport of upstream #1440: the account-signature prefix follows the SIGNED inner
+        // device_type, not the outer HMAC account_type (they can differ, e.g. some Business
+        // primaries), else pairing fails with 401 signature-mismatch.
+        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
+            .map_err(|e| PairCryptoError {
+                code: 500,
+                text: "internal-error",
+                source: e.into(),
+            })?;
+        let account_sig_prefix = if identity_details.device_type == Some(ADVEncryptionType::HOSTED)
+        {
             ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
         } else {
             ADV_PREFIX_ACCOUNT_SIGNATURE
@@ -277,11 +286,8 @@ impl PairUtils {
         }
 
         // 3. Generate our device signature
-        let device_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION
-        } else {
-            ADV_PREFIX_DEVICE_SIGNATURE_GENERATE
-        };
+        // Upstream #1440: a companion always signs with [6, 1], hosted account or not.
+        let device_sig_prefix = ADV_PREFIX_DEVICE_SIGNATURE_GENERATE;
 
         let msg_to_sign = Self::concat_bytes(&[
             device_sig_prefix,
@@ -300,13 +306,7 @@ impl PairUtils {
             })?;
         signed_identity.device_signature = Some(device_signature.to_vec());
 
-        // 4. Unmarshal final details to get key_index
-        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
-            .map_err(|e| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: e.into(),
-            })?;
+        // 4. key_index from the details decoded above
         let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
             code: 500,
             text: "internal-error",
@@ -700,6 +700,23 @@ mod tests {
         is_hosted: bool,
         key_index: Option<u32>,
     ) -> Vec<u8> {
+        build_pair_success_payload_typed(
+            state,
+            adv_secret_for_hmac,
+            is_hosted,
+            is_hosted,
+            key_index,
+        )
+    }
+
+    /// `outer_hosted` sets the HMAC container's account_type; `inner_hosted` the signed device_type.
+    fn build_pair_success_payload_typed(
+        state: &DeviceState,
+        adv_secret_for_hmac: &[u8; 32],
+        is_hosted: bool,
+        inner_hosted: bool,
+        key_index: Option<u32>,
+    ) -> Vec<u8> {
         use buffa::Message;
         use waproto::whatsapp as wa;
 
@@ -715,10 +732,14 @@ mod tests {
             timestamp: Some(0),
             key_index,
             account_type: Some(account_type),
-            device_type: Some(account_type),
+            device_type: Some(if inner_hosted {
+                ADVEncryptionType::HOSTED
+            } else {
+                ADVEncryptionType::E2EE
+            }),
         }
         .encode_to_vec();
-        let account_sig_prefix: &[u8] = if is_hosted {
+        let account_sig_prefix: &[u8] = if inner_hosted {
             ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
         } else {
             ADV_PREFIX_ACCOUNT_SIGNATURE
@@ -931,6 +952,16 @@ mod tests {
                 .build()])
             .build();
         assert!(PairUtils::extract_pairing_props(&malformed.as_node_ref()).is_none());
+    }
+
+    #[test]
+    fn do_pair_crypto_accepts_hosted_hmac_with_e2ee_signed_device() {
+        // Upstream #1439: outer account_type HOSTED, signed device_type E2EE → must pair.
+        let state = dummy_device_state();
+        let payload =
+            build_pair_success_payload_typed(&state, &state.adv_secret_key, true, false, Some(0));
+        PairUtils::do_pair_crypto(&state, &payload)
+            .expect("mixed account/device types must verify");
     }
 
     #[test]
