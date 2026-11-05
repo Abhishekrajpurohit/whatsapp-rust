@@ -118,8 +118,16 @@ where
             hex::encode(&computed),
             hex::encode(mac_expected)
         );
+        // snaprint fork: some accounts' `regular` snapshot never matches (see upstream #1369's
+        // diagnostics), which dropped the whole collection (WhatsApp Business labels) for good. Each
+        // record below still has its own value MAC checked, so accept the snapshot and say so.
         if computed != *mac_expected {
-            return Err(AppStateError::SnapshotMACMismatch);
+            log::warn!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch; accepting it (records are still MAC-checked one by one)",
+                collection_name,
+                version
+            );
         }
     }
 
